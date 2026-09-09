@@ -185,13 +185,18 @@ function monthKey(ts) {
   const d = new Date(ts);
   return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}`;
 }
+// المصروف يُحسب للشهر المحدَّد له يدويًا (لو موجود) بدل شهر تاريخ الدفع الفعلي —
+// يسمح بتسجيل مصروف دُفع بشهر لاحق لكن ينتمي محاسبيًا لشهر سابق
+function expensePeriod(e) {
+  return e.periodLabel || monthKey(e.ts);
+}
 function currentMonthKey() {
   return monthKey(nowISO());
 }
 function computeMonthFinancials(db, periodLabel) {
   const invoices = db.invoices.filter((i) => monthKey(i.ts) === periodLabel);
   const returns = db.returns.filter((r) => monthKey(r.ts) === periodLabel);
-  const expenses = db.expenses.filter((e) => monthKey(e.ts) === periodLabel);
+  const expenses = db.expenses.filter((e) => expensePeriod(e) === periodLabel);
 
   const grossSales = invoices.reduce((s, i) => s + i.total, 0);
   const cogs = invoices.reduce((s, i) => s + i.lines.reduce((s2, l) => s2 + l.cost * l.qty, 0), 0);
@@ -258,17 +263,23 @@ function computePartnerHistory(db, partnerId) {
 ============================================================ */
 function getAllPeriodRows(db) {
   const rows = {};
+  // المصروفات الحقيقية المُسجّلة بتبويب "المصروفات" تُضاف دائمًا فوق أي رقم تاريخي مُدخل يدويًا —
+  // ما تستبدله (عشان الأشهر اللي دخلناها كملخّص بس بدون تسجيل تفصيلي ما تنصفر)،
+  // بس أي مصروف حقيقي جديد لنفس الشهر ينعكس بالتقرير تلقائيًا فوق الرقم الأصلي
   for (const p of db.periodClosures) {
+    const liveExpenses = db.expenses.filter((e) => expensePeriod(e) === p.periodLabel).reduce((s, e) => s + Number(e.amount), 0);
+    const totalExpenses = (p.expenses || 0) + liveExpenses;
+    const grossProfit = p.grossProfit != null ? p.grossProfit : (p.netProfit || 0) + (p.expenses || 0);
     rows[p.periodLabel] = {
       periodLabel: p.periodLabel,
       displayLabel: p.displayLabel || p.periodLabel,
-      sales: p.sales || 0, cogs: p.cost || 0, expenses: p.expenses || 0,
-      netProfit: p.netProfit || 0, closed: true,
+      sales: p.sales || 0, cogs: p.cost || 0, expenses: totalExpenses,
+      netProfit: grossProfit - totalExpenses, closed: true,
     };
   }
   const liveKeys = new Set();
   db.invoices.forEach((i) => liveKeys.add(monthKey(i.ts)));
-  db.expenses.forEach((e) => liveKeys.add(monthKey(e.ts)));
+  db.expenses.forEach((e) => liveKeys.add(expensePeriod(e)));
   db.returns.forEach((r) => liveKeys.add(monthKey(r.ts)));
   for (const mk of liveKeys) {
     if (rows[mk]) continue;
@@ -2133,6 +2144,7 @@ function ExpensesView({ db, update, showToast }) {
   const [method, setMethod] = useState("كاش");
   const [notes, setNotes] = useState("");
   const [date, setDate] = useState(() => new Date().toISOString().slice(0, 10));
+  const [period, setPeriod] = useState(() => new Date().toISOString().slice(0, 7));
   const [editingExpense, setEditingExpense] = useState(null);
   const submittingRef = useRef(false);
 
@@ -2144,13 +2156,14 @@ function ExpensesView({ db, update, showToast }) {
     const chosenDate = date || new Date().toISOString().slice(0, 10);
     const now = new Date();
     const ts = new Date(`${chosenDate}T${String(now.getHours()).padStart(2, "0")}:${String(now.getMinutes()).padStart(2, "0")}:00`).toISOString();
-    update((next) => { next.expenses.push({ id: uid(), ts, type, amount: amt, method, notes }); });
+    const periodLabel = period || chosenDate.slice(0, 7);
+    update((next) => { next.expenses.push({ id: uid(), ts, type, amount: amt, method, notes, periodLabel }); });
     setAmount(""); setNotes("");
     showToast("✔ تم تسجيل المصروف");
     setTimeout(() => { submittingRef.current = false; }, 700);
   }
 
-  const monthTotal = db.expenses.filter((e) => monthKey(e.ts) === currentMonthKey()).reduce((s, e) => s + e.amount, 0);
+  const monthTotal = db.expenses.filter((e) => expensePeriod(e) === currentMonthKey()).reduce((s, e) => s + e.amount, 0);
 
   return (
     <div className="rb-grid" style={{ display: "grid", gridTemplateColumns: "340px 1fr", gap: 16 }}>
@@ -2163,7 +2176,12 @@ function ExpensesView({ db, update, showToast }) {
             </select>
           </Field>
           <div style={{ height: 10 }} />
-          <Field label="التاريخ (الشهر/السنة)"><input type="date" value={date} onChange={(e) => setDate(e.target.value)} style={inputStyle} /></Field>
+          <Field label="تاريخ الدفع الفعلي"><input type="date" value={date} onChange={(e) => setDate(e.target.value)} style={inputStyle} /></Field>
+          <div style={{ height: 10 }} />
+          <Field label="الشهر الذي يُحسب له محاسبيًا">
+            <input type="month" value={period} onChange={(e) => setPeriod(e.target.value)} style={inputStyle} />
+          </Field>
+          <div style={{ fontSize: 11.5, color: C.muted, marginTop: -4 }}>مفيد لو دفعتِ المصروف بشهر لاحق بس هو ينتمي لشهر سابق (زي إيجار متأخر)</div>
           <div style={{ height: 10 }} />
           <Field label="المبلغ"><input type="number" value={amount} onChange={(e) => setAmount(e.target.value)} style={inputStyle} /></Field>
           <div style={{ height: 10 }} />
@@ -2187,7 +2205,12 @@ function ExpensesView({ db, update, showToast }) {
             <div key={e.id} style={{ display: "flex", justifyContent: "space-between", alignItems: "center", padding: "10px 16px", borderBottom: `1px solid ${C.line}`, fontSize: 14, gap: 8 }}>
               <div style={{ flex: 1 }}>
                 <div style={{ fontWeight: 700 }}>{e.type} {e.notes ? `— ${e.notes}` : ""}</div>
-                <div style={{ color: C.muted, fontSize: 13 }}>{fmtDate(e.ts)} — {e.method}</div>
+                <div style={{ color: C.muted, fontSize: 13 }}>
+                  {fmtDate(e.ts)} — {e.method}
+                  {e.periodLabel && e.periodLabel !== monthKey(e.ts) && (
+                    <span style={{ color: C.amber, fontWeight: 700 }}> — محسوب لشهر {(() => { const [y, m] = e.periodLabel.split("-"); return `${ARABIC_MONTHS[Number(m) - 1]} ${y}`; })()}</span>
+                  )}
+                </div>
               </div>
               <div style={{ fontWeight: 800, color: C.red }}>− {fmtMoney(e.amount)} ج.م</div>
               <button onClick={() => setEditingExpense(e.id)} title="تعديل" style={{ border: "none", background: "transparent", color: C.plum, cursor: "pointer", padding: 4 }}>
@@ -2211,6 +2234,7 @@ function EditExpenseModal({ db, update, showToast, expenseId, onClose }) {
   const [method, setMethod] = useState(expense?.method || "كاش");
   const [notes, setNotes] = useState(expense?.notes || "");
   const [date, setDate] = useState(() => (expense ? expense.ts.slice(0, 10) : new Date().toISOString().slice(0, 10)));
+  const [period, setPeriod] = useState(() => (expense ? expensePeriod(expense) : new Date().toISOString().slice(0, 7)));
 
   if (!expense) return null;
 
@@ -2218,9 +2242,10 @@ function EditExpenseModal({ db, update, showToast, expenseId, onClose }) {
     if (!amount || Number(amount) <= 0) { showToast("⚠ أدخل مبلغًا صحيحًا", "err"); return; }
     const oldTime = expense.ts.slice(11, 19);
     const ts = new Date(`${date}T${oldTime}`).toISOString();
+    const periodLabel = period || date.slice(0, 7);
     update((next) => {
       const ex = next.expenses.find((e) => e.id === expenseId);
-      if (ex) { ex.type = type; ex.amount = Number(amount); ex.method = method; ex.notes = notes; ex.ts = ts; }
+      if (ex) { ex.type = type; ex.amount = Number(amount); ex.method = method; ex.notes = notes; ex.ts = ts; ex.periodLabel = periodLabel; }
     });
     showToast("✔ تم حفظ التعديلات");
     onClose();
@@ -2243,7 +2268,9 @@ function EditExpenseModal({ db, update, showToast, expenseId, onClose }) {
           </select>
         </Field>
         <div style={{ height: 10 }} />
-        <Field label="التاريخ"><input type="date" value={date} onChange={(e) => setDate(e.target.value)} style={inputStyle} /></Field>
+        <Field label="تاريخ الدفع الفعلي"><input type="date" value={date} onChange={(e) => setDate(e.target.value)} style={inputStyle} /></Field>
+        <div style={{ height: 10 }} />
+        <Field label="الشهر الذي يُحسب له محاسبيًا"><input type="month" value={period} onChange={(e) => setPeriod(e.target.value)} style={inputStyle} /></Field>
         <div style={{ height: 10 }} />
         <Field label="المبلغ"><input type="number" value={amount} onChange={(e) => setAmount(e.target.value)} style={inputStyle} /></Field>
         <div style={{ height: 10 }} />
@@ -2441,6 +2468,7 @@ function PartnersView({ db, update, showToast }) {
   const alreadyClosed = db.periodClosures.find((p) => p.periodLabel === period);
   const [payAmount, setPayAmount] = useState({});
   const [expandedHistory, setExpandedHistory] = useState({});
+  const [editingMonth, setEditingMonth] = useState(null);
 
   const now = new Date();
   const [histMonth, setHistMonth] = useState(String(now.getMonth() + 1).padStart(2, "0"));
@@ -2491,6 +2519,15 @@ function PartnersView({ db, update, showToast }) {
     setHistSales(""); setHistCost(""); setHistGrossDirect(""); setHistExpenses("");
   }
 
+  function deleteHistoricalMonth(closureId, periodLabel, displayLabel) {
+    if (!window.confirm(`حذف بيانات ${displayLabel || periodLabel}؟\n\nسيرجع هذا الشهر يُحسب مباشرة من الفواتير والمصروفات الفعلية المسجّلة له (بدل الأرقام الثابتة اللي أدخلتيها)، وسيُحذف توزيع الربح المرتبط به من سجل الشركاء — لازم تراجعي أرصدة الشركاء بعدها.`)) return;
+    update((next) => {
+      next.periodClosures = next.periodClosures.filter((p) => p.id !== closureId);
+      next.partnerTransactions = next.partnerTransactions.filter((t) => !(t.type === "accrued" && t.periodLabel === periodLabel));
+    });
+    showToast("✔ تم الحذف — الشهر يُحسب الآن من البيانات الفعلية");
+  }
+
   function payPartner(partnerId, amountOverride, periodLabel) {
     const amt = Number(amountOverride ?? payAmount[partnerId] ?? 0);
     if (amt <= 0) { showToast("⚠ أدخل مبلغًا صحيحًا", "err"); return; }
@@ -2506,6 +2543,7 @@ function PartnersView({ db, update, showToast }) {
   }
 
   return (
+    <>
     <div>
       <Panel>
         <div style={{ padding: 18 }}>
@@ -2575,13 +2613,21 @@ function PartnersView({ db, update, showToast }) {
             <div style={{ marginTop: 16, borderTop: `1px solid ${C.line}`, paddingTop: 12 }}>
               <div style={{ fontSize: 13.5, fontWeight: 700, color: C.muted, marginBottom: 8 }}>الأشهر التاريخية المُدخَلة</div>
               {db.periodClosures.filter((p) => p.isHistorical).map((p) => (
-                <div key={p.id} style={{ display: "flex", justifyContent: "space-between", padding: "8px 0", borderBottom: `1px solid ${C.line}`, fontSize: 14 }}>
+                <div key={p.id} style={{ display: "flex", justifyContent: "space-between", alignItems: "center", padding: "8px 0", borderBottom: `1px solid ${C.line}`, fontSize: 14, gap: 8 }}>
                   <span style={{ fontWeight: 700 }}>{p.displayLabel || p.periodLabel}</span>
                   <span style={{ color: C.muted }}>
                     {p.sales != null ? `مبيعات ${fmtMoney(p.sales)} — تكلفة ${fmtMoney(p.cost)} — ` : ""}
                     مصروفات {fmtMoney(p.expenses)}
                   </span>
                   <span style={{ fontWeight: 800, color: C.green }}>صافي {fmtMoney(p.netProfit)}</span>
+                  <button onClick={() => setEditingMonth(p.id)} title="تعديل"
+                    style={{ border: "none", background: "transparent", color: C.plum, cursor: "pointer", padding: 4 }}>
+                    <Edit2 size={15} />
+                  </button>
+                  <button onClick={() => deleteHistoricalMonth(p.id, p.periodLabel, p.displayLabel)} title="حذف — يرجّع الشهر لحساب مباشر من البيانات الفعلية"
+                    style={{ border: "none", background: "transparent", color: C.red, cursor: "pointer", padding: 4 }}>
+                    <Trash2 size={15} />
+                  </button>
                 </div>
               ))}
             </div>
@@ -2623,8 +2669,80 @@ function PartnersView({ db, update, showToast }) {
         })}
       </div>
     </div>
+    {editingMonth && (
+      <EditHistoricalMonthModal db={db} update={update} showToast={showToast} closureId={editingMonth} onClose={() => setEditingMonth(null)} />
+    )}
+    </>
   );
 }
+function EditHistoricalMonthModal({ db, update, showToast, closureId, onClose }) {
+  const closure = db.periodClosures.find((p) => p.id === closureId);
+  const [mode, setMode] = useState(closure && closure.sales != null ? "detailed" : "grossOnly");
+  const [sales, setSales] = useState(closure?.sales ?? "");
+  const [cost, setCost] = useState(closure?.cost ?? "");
+  const [grossDirect, setGrossDirect] = useState(closure?.sales == null ? (closure?.grossProfit ?? "") : "");
+  const [expenses, setExpenses] = useState(closure?.expenses ?? "");
+
+  if (!closure) return null;
+
+  const gross = mode === "detailed" ? (Number(sales) || 0) - (Number(cost) || 0) : (Number(grossDirect) || 0);
+  const net = gross - (Number(expenses) || 0);
+
+  function save() {
+    if (mode === "detailed" && (!sales || Number(sales) <= 0)) { showToast("⚠ أدخل إجمالي المبيعات", "err"); return; }
+    if (mode === "grossOnly" && (!grossDirect || Number(grossDirect) === 0)) { showToast("⚠ أدخل الربح الإجمالي", "err"); return; }
+    update((next) => {
+      const c = next.periodClosures.find((p) => p.id === closureId);
+      if (!c) return;
+      c.sales = mode === "detailed" ? Number(sales) : null;
+      c.cost = mode === "detailed" ? Number(cost) : null;
+      c.grossProfit = gross;
+      c.expenses = Number(expenses) || 0;
+      c.netProfit = net;
+      for (const p of next.partners) {
+        const share = (net * p.percentage) / 100;
+        const existing = next.partnerTransactions.find((t) => t.type === "accrued" && t.periodLabel === c.periodLabel && t.partnerId === p.id);
+        if (existing) existing.amount = share;
+        else next.partnerTransactions.push({ id: uid(), ts: nowISO(), partnerId: p.id, type: "accrued", amount: share, periodLabel: c.periodLabel, notes: `ربح تاريخي — ${c.displayLabel}` });
+      }
+    });
+    showToast("✔ تم حفظ التعديلات وتحديث استحقاقات الشركاء");
+    onClose();
+  }
+
+  return (
+    <div className="no-print" style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,.45)", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 100, padding: 16 }}>
+      <div style={{ background: "#fff", borderRadius: 16, padding: 24, width: "min(460px,94vw)", maxHeight: "88vh", overflow: "auto", boxShadow: "0 20px 50px rgba(0,0,0,.25)" }}>
+        <div style={{ fontWeight: 800, fontSize: 16.5, marginBottom: 16, color: C.plumDeep }}>تعديل بيانات {closure.displayLabel || closure.periodLabel}</div>
+        <div style={{ display: "flex", gap: 8, marginBottom: 14 }}>
+          <button onClick={() => setMode("detailed")} style={{ padding: "7px 14px", borderRadius: 9, border: `1.5px solid ${mode === "detailed" ? C.plum : C.line}`, background: mode === "detailed" ? C.plum : "#fff", color: mode === "detailed" ? "#fff" : C.muted, fontWeight: 700, fontSize: 13, cursor: "pointer" }}>عندي مبيعات وتكلفة منفصلة</button>
+          <button onClick={() => setMode("grossOnly")} style={{ padding: "7px 14px", borderRadius: 9, border: `1.5px solid ${mode === "grossOnly" ? C.plum : C.line}`, background: mode === "grossOnly" ? C.plum : "#fff", color: mode === "grossOnly" ? "#fff" : C.muted, fontWeight: 700, fontSize: 13, cursor: "pointer" }}>عندي الربح الإجمالي فقط</button>
+        </div>
+        {mode === "detailed" ? (
+          <>
+            <Field label="إجمالي المبيعات"><input type="number" value={sales} onChange={(e) => setSales(e.target.value)} style={inputStyle} /></Field>
+            <div style={{ height: 10 }} />
+            <Field label="إجمالي التكلفة (الجملة)"><input type="number" value={cost} onChange={(e) => setCost(e.target.value)} style={inputStyle} /></Field>
+          </>
+        ) : (
+          <Field label="الربح الإجمالي (قبل المصروفات)"><input type="number" value={grossDirect} onChange={(e) => setGrossDirect(e.target.value)} style={inputStyle} /></Field>
+        )}
+        <div style={{ height: 10 }} />
+        <Field label="إجمالي المصروفات (الأساسية المُدخلة يدويًا)"><input type="number" value={expenses} onChange={(e) => setExpenses(e.target.value)} style={inputStyle} /></Field>
+        <div style={{ fontSize: 11.5, color: C.muted, marginTop: 4 }}>ملاحظة: أي مصروف حقيقي مسجَّل بتبويب "المصروفات" لنفس الشهر يُضاف تلقائيًا فوق هذا الرقم بالتقارير</div>
+        <div style={{ background: C.cream, borderRadius: 10, padding: 12, marginTop: 14, display: "flex", justifyContent: "space-between" }}>
+          <span style={{ fontSize: 13, color: C.muted }}>صافي الربح الجديد</span>
+          <span style={{ fontWeight: 800, color: net >= 0 ? C.green : C.red }}>{fmtMoney(net)} ج.م</span>
+        </div>
+        <div style={{ display: "flex", gap: 8, marginTop: 18 }}>
+          <button onClick={save} style={{ ...smallBtnFilled, flex: 1, padding: 12 }}>حفظ التعديلات</button>
+          <button onClick={onClose} style={{ ...smallBtnOutline, flex: 1, padding: 12 }}>إلغاء</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 function PartnerPaymentsLog({ db, update, showToast, partnerId }) {
   const payments = (db.partnerTransactions || [])
     .filter((t) => t.partnerId === partnerId && t.type === "paid")
